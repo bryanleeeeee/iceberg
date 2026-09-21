@@ -6,7 +6,7 @@ This project keeps HDFS as the storage layer. It does not move data to object st
 
 ## Contents
 
-- `hdfs_to_iceberg_hardened.py` - PySpark command-line tool for preflight checks, inventory, sandbox validation, governed cutover, validation, rollback, optimization, and status reporting.
+- `hdfs_to_iceberg_hardened.py` - PySpark command-line tool for read-only HDFS/Hive assessment, preflight checks, inventory, sandbox validation, governed cutover, validation, rollback, optimization, and status reporting.
 - `HDFS_to_Iceberg_Migration_Plan_and_Runbook.docx` - detailed migration plan and production operating runbook.
 
 ## Safety model
@@ -48,6 +48,16 @@ spark-submit ... hdfs_to_iceberg_hardened.py inventory \
   --databases sales,risk --with-size \
   --out evidence/plan.csv
 
+# 2a. Produce the detailed, read-only assessment for the current HDFS estate.
+# It reads Hive metastore and HDFS metadata only; it makes no table or file changes.
+spark-submit --master yarn --deploy-mode client \
+  hdfs_to_iceberg_hardened.py assess \
+  --databases sales,risk \
+  --report-out evidence/iceberg_migration_assessment.md \
+  --json-out evidence/iceberg_migration_assessment.json \
+  --plan-out evidence/plan.csv \
+  --rewrite-throughput-gb-per-hour 250
+
 # 3. Create and validate sandbox targets before approval
 spark-submit ... hdfs_to_iceberg_hardened.py run \
   --plan evidence/plan.csv \
@@ -86,6 +96,16 @@ spark-submit ... hdfs_to_iceberg_hardened.py rollback \
 ```
 
 Do not use `DROP ... PURGE`, aggressive snapshot expiry, or orphan-file cleanup while rollback objects or dependent snapshots may need the underlying files.
+
+## Readiness assessment
+
+`assess` is the recommended starting point for a current Cloudera HDFS estate. It produces:
+
+- A Markdown decision report with strategy mix, total and rewrite volume, planning-duration estimate, preflight result, required gates, and a risk-ranked table inventory.
+- A JSON report containing the same data plus HDFS URI, owner, group, permission, replication, and encryption-zone metadata where the cluster permits inspection.
+- An editable CSV plan compatible with the existing `run` command. Every row starts unapproved.
+
+The report’s risk band is a transparent prioritisation aid, not a production approval. It does not inspect Ranger policies, data quality, lineage, active writers, or cross-engine behavior. Calibrate the throughput flag with a representative pilot and complete the runbook controls before cutover.
 
 ## Operational commands
 

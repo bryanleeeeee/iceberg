@@ -4,6 +4,7 @@
 Commands:
   preflight  Validate cluster-level prerequisites and write evidence JSON.
   inventory  Build an editable CSV migration plan.
+  assess     Produce a read-only HDFS/Hive readiness report and migration plan.
   run        Create and validate a sandbox copy, or execute approved cutovers.
   validate   Compare schema, row count, dual checksums and optional partitions.
   rollback   Restore one migrated/CTAS table after explicit confirmation.
@@ -33,7 +34,7 @@ import time
 import uuid
 from dataclasses import asdict, dataclass
 from decimal import Decimal
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from pyspark.sql import DataFrame, SparkSession, functions as F
 
@@ -257,6 +258,93 @@ def directory_stats(spark: SparkSession, location: str) -> Tuple[int, int]:
     return int(summary.getLength()), int(summary.getFileCount())
 
 
+def hdfs_location_assessment(spark: SparkSession, location: str) -> Dict[str, object]:
+    """Collect only HDFS metadata. Individual fields are best-effort by design.
+
+    A missing permission to inspect an encryption zone, for example, must not make
+    the whole assessment unusable; the report marks that field as unavailable.
+    """
+    result: Dict[str, object] = {"location": location}
+    if not location:
+        result["error"] = "Hive metastore did not return a table location"
+        return result
+    try:
+        jvm = spark._jvm
+        conf = spark._jsc.hadoopConfiguration()
+        path = jvm.org.apache.hadoop.fs.Path(location)
+        fs = path.getFileSystem(conf)
+        status = fs.getFileStatus(path)
+        byte_count, file_count = directory_stats(spark, location)
+        result.update(
+            uri=str(fs.getUri()),
+            bytes=byte_count,
+            files=file_count,
+            average_file_mb=round(byte_count / max(file_count, 1) / 1024**2, 2),
+            owner=str(status.getOwner()),
+            group=str(status.getGroup()),
+            permission=str(status.getPermission()),
+            replication=int(status.getReplication()),
+        )
+        # HdfsAdmin is deliberately optional: this also works against compatible
+        # filesystems where the HDFS client class is not present.
+        try:
+            admin = jvm.org.apache.hadoop.hdfs.client.HdfsAdmin(fs.getUri(), conf)
+            zone = admin.getEncryptionZoneForPath(path)
+            result["encryption_zone"] = str(zone.getPath()) if zone else "none"
+        except Exception as exc:
+            result["encryption_zone"] = "unavailable"
+            result["encryption_zone_note"] = str(exc)
+    except Exception as exc:
+        result["error"] = str(exc)
+    return result
+
+
+def build_inventory_rows(spark: SparkSession, databases: str, with_size: bool,
+                         allow_avro_migrate: bool) -> List[Dict[str, object]]:
+    """Return one safe, editable plan row per Hive object without changing it."""
+    rows: List[Dict[str, object]] = []
+    for database in [x.strip() for x in databases.split(",") if x.strip()]:
+        quote_ident(database)
+        for table_row in spark.sql(f"SHOW TABLES IN {quote_ident(database)}").collect():
+            if table_row["isTemporary"]:
+                continue
+            fq = f"{database}.{table_row['tableName']}"
+            try:
+                columns, partitions, metadata = describe_table(spark, fq)
+                fmt, strategy, compatible, casts, note = classify(
+                    metadata, columns, allow_avro_migrate
+                )
+                location = metadata.get("Location", "")
+                size_gb: object = ""
+                files: object = ""
+                avg_mb: object = ""
+                compact = ""
+                if with_size and location and strategy not in ("skip", "manual"):
+                    byte_count, file_count = directory_stats(spark, location)
+                    size_gb = round(byte_count / 1024**3, 2)
+                    files = file_count
+                    avg_mb = round(byte_count / max(file_count, 1) / 1024**2, 1)
+                    compact = "Y" if avg_mb < SMALL_FILE_MB else "N"
+                rows.append({
+                    "table": fq, "source_type": source_type(metadata), "strategy": strategy,
+                    "approved": "N", "writer_freeze_ticket": "", "format": fmt,
+                    "schema_compatible": "Y" if compatible else "N",
+                    "cast_columns": ";".join(f"{k}:{v}" for k, v in casts.items()),
+                    "partitions": ";".join(partitions),
+                    "target_partition_spec": ";".join(partitions), "location": location,
+                    "target_location": "", "size_gb": size_gb, "files": files,
+                    "avg_file_mb": avg_mb, "compact": compact,
+                    "target_format_version": "2", "note": note,
+                })
+                LOG.info("%-55s %-10s %s", fq, strategy, note)
+            except Exception as exc:
+                LOG.exception("Inventory failed for %s", fq)
+                row = {field: "" for field in PLAN_FIELDS}
+                row.update(table=fq, strategy="manual", approved="N", note=f"inventory error: {exc}")
+                rows.append(row)
+    return rows
+
+
 def fs_preflight(spark: SparkSession, require_ha: bool = True) -> Dict[str, object]:
     conf = spark._jsc.hadoopConfiguration()
     fs_default = conf.get("fs.defaultFS", "")
@@ -302,64 +390,136 @@ def cmd_preflight(spark: SparkSession, args: argparse.Namespace) -> int:
 
 
 def cmd_inventory(spark: SparkSession, args: argparse.Namespace) -> int:
-    rows: List[Dict[str, object]] = []
-    for database in [x.strip() for x in args.databases.split(",") if x.strip()]:
-        quote_ident(database)
-        for table_row in spark.sql(f"SHOW TABLES IN {quote_ident(database)}").collect():
-            if table_row["isTemporary"]:
-                continue
-            fq = f"{database}.{table_row['tableName']}"
-            try:
-                columns, partitions, metadata = describe_table(spark, fq)
-                fmt, strategy, compatible, casts, note = classify(
-                    metadata, columns, args.allow_avro_migrate
-                )
-                location = metadata.get("Location", "")
-                size_gb: object = ""
-                files: object = ""
-                avg_mb: object = ""
-                compact = ""
-                if args.with_size and location and strategy not in ("skip", "manual"):
-                    byte_count, file_count = directory_stats(spark, location)
-                    size_gb = round(byte_count / 1024**3, 2)
-                    files = file_count
-                    avg_mb = round(byte_count / max(file_count, 1) / 1024**2, 1)
-                    compact = "Y" if avg_mb < SMALL_FILE_MB else "N"
-                kind = source_type(metadata)
-                rows.append(
-                    {
-                        "table": fq,
-                        "source_type": kind,
-                        "strategy": strategy,
-                        "approved": "N",
-                        "writer_freeze_ticket": "",
-                        "format": fmt,
-                        "schema_compatible": "Y" if compatible else "N",
-                        "cast_columns": ";".join(f"{k}:{v}" for k, v in casts.items()),
-                        "partitions": ";".join(partitions),
-                        "target_partition_spec": ";".join(partitions),
-                        "location": location,
-                        "target_location": "",
-                        "size_gb": size_gb,
-                        "files": files,
-                        "avg_file_mb": avg_mb,
-                        "compact": compact,
-                        "target_format_version": "2",
-                        "note": note,
-                    }
-                )
-                LOG.info("%-55s %-10s %s", fq, strategy, note)
-            except Exception as exc:
-                LOG.exception("Inventory failed for %s", fq)
-                row = {field: "" for field in PLAN_FIELDS}
-                row.update(table=fq, strategy="manual", approved="N", note=f"inventory error: {exc}")
-                rows.append(row)
+    rows = build_inventory_rows(spark, args.databases, args.with_size, args.allow_avro_migrate)
     with open(args.out, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=PLAN_FIELDS)
         writer.writeheader()
         writer.writerows(rows)
     LOG.info("Wrote %d plan rows to %s", len(rows), args.out)
     return 0
+
+
+def assessment_risk(row: Dict[str, object], location: Dict[str, object]) -> Tuple[str, int, List[str]]:
+    """Return a transparent prioritisation aid, not an approval decision."""
+    strategy = str(row.get("strategy", "manual"))
+    base = {"skip": 0, "migrate": 25, "ctas": 55, "hive_ctas": 75, "manual": 85}.get(strategy, 85)
+    reasons = [str(row.get("note", ""))]
+    if row.get("compact") == "Y":
+        base += 10
+        reasons.append("small-file remediation should be planned")
+    if location.get("error"):
+        base += 10
+        reasons.append("HDFS metadata collection failed")
+    score = min(base, 100)
+    band = "critical" if score >= 80 else "high" if score >= 55 else "moderate" if score else "not-applicable"
+    return band, score, [reason for reason in reasons if reason]
+
+
+def markdown_cell(value: object) -> str:
+    return str(value).replace("|", "\\|").replace("\n", " ")
+
+
+def cmd_assess(spark: SparkSession, args: argparse.Namespace) -> int:
+    """Create a read-only migration readiness assessment from HMS and HDFS metadata."""
+    preflight = fs_preflight(spark, require_ha=not args.allow_non_ha)
+    # HDFS is queried once below so a single inaccessible table never turns the
+    # entire metastore object into an inventory failure.
+    rows = build_inventory_rows(spark, args.databases, False, args.allow_avro_migrate)
+    assessed: List[Dict[str, object]] = []
+    total_bytes = 0
+    rewrite_bytes = 0
+    counts: Dict[str, int] = {}
+    for row in rows:
+        hdfs = hdfs_location_assessment(spark, str(row.get("location", "")))
+        # Use assessment's filesystem result even for manual/skip objects, because
+        # it is still valuable in capacity and permission planning.
+        if isinstance(hdfs.get("bytes"), int):
+            byte_count = int(hdfs["bytes"])
+            file_count = int(hdfs["files"])
+            row["size_gb"] = round(byte_count / 1024**3, 2)
+            row["files"] = file_count
+            row["avg_file_mb"] = round(byte_count / max(file_count, 1) / 1024**2, 1)
+            row["compact"] = "Y" if float(row["avg_file_mb"]) < SMALL_FILE_MB else "N"
+            total_bytes += int(hdfs["bytes"])
+            if row["strategy"] in ("ctas", "hive_ctas"):
+                rewrite_bytes += int(hdfs["bytes"])
+        risk_band, risk_score, risks = assessment_risk(row, hdfs)
+        counts[str(row["strategy"])] = counts.get(str(row["strategy"]), 0) + 1
+        assessed.append({**row, "risk_band": risk_band, "risk_score": risk_score,
+                         "risk_reasons": risks, "hdfs": hdfs})
+
+    throughput = args.rewrite_throughput_gb_per_hour
+    rewrite_gb = rewrite_bytes / 1024**3
+    hours = round(rewrite_gb / throughput, 1) if throughput > 0 else None
+    report: Dict[str, Any] = {
+        "assessment_version": 1,
+        "generated_at_utc": utc_now(),
+        "scope": {"databases": args.databases, "read_only": True},
+        "cluster_preflight": preflight,
+        "summary": {
+            "objects_scanned": len(assessed), "strategy_counts": counts,
+            "hdfs_bytes": total_bytes, "hdfs_gb": round(total_bytes / 1024**3, 2),
+            "rewrite_bytes": rewrite_bytes, "rewrite_gb": round(rewrite_gb, 2),
+            "estimated_rewrite_hours": hours,
+            "assumed_rewrite_throughput_gb_per_hour": throughput,
+        },
+        "assessment_limits": [
+            "Read-only metadata assessment; it does not sample data, query lineage, or test Impala/application compatibility.",
+            "The duration is a planning estimate only. Calibrate throughput from a representative pilot.",
+            "Ranger policy and HDFS ACL authorization must be reviewed by the owning platform team.",
+        ],
+        "tables": assessed,
+    }
+    for path, payload in ((args.json_out, report),):
+        parent = os.path.dirname(os.path.abspath(path))
+        os.makedirs(parent, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True, default=str)
+    with open(args.plan_out, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=PLAN_FIELDS)
+        writer.writeheader()
+        writer.writerows([{field: row.get(field, "") for field in PLAN_FIELDS} for row in rows])
+
+    lines = [
+        "# Iceberg Migration Readiness Assessment", "",
+        f"Generated (UTC): {report['generated_at_utc']}", "",
+        "## Scope and readiness", "",
+        f"- Hive databases: `{args.databases}`", f"- Objects scanned: {len(assessed)}",
+        f"- HDFS data observed: {report['summary']['hdfs_gb']:,} GiB",
+        f"- Estimated rewrite volume: {report['summary']['rewrite_gb']:,} GiB",
+        f"- Planning estimate: {hours if hours is not None else 'not calculated'} hours at {throughput} GiB/hour",
+        f"- Cluster preflight: {'PASS' if preflight['ok'] else 'REVIEW REQUIRED'}", "",
+        "## Migration strategy", "",
+        "| Strategy | Objects | Meaning |", "| --- | ---: | --- |",
+    ]
+    meanings = {"migrate": "Candidate for validated metadata migration", "ctas": "Rewrite to a new Iceberg table",
+                "hive_ctas": "ACID path requiring approved Hive/HWC procedure", "manual": "Blocking review required",
+                "skip": "View or already Iceberg"}
+    for strategy, count in sorted(counts.items()):
+        lines.append(f"| {strategy} | {count} | {meanings.get(strategy, 'Review')} |")
+    lines += ["", "## Required gates", "",
+              "1. Resolve every `critical`/`high` row and nominate an owner.",
+              "2. Pilot one representative table per format, partitioning pattern, and strategy.",
+              "3. Capture a writer-freeze ticket, source recovery evidence, and Spark plus Impala validation for each cutover.",
+              "4. Do not remove legacy data, expire snapshots, or clean orphan files until the approved rollback window closes.",
+              "", "## Table assessment", "",
+              "| Table | Strategy | Risk | Size GiB | Files | Avg MiB | HDFS encryption zone | Finding |",
+              "| --- | --- | --- | ---: | ---: | ---: | --- | --- |"]
+    for row in sorted(assessed, key=lambda item: (-int(item["risk_score"]), str(item["table"]))):
+        hdfs = row["hdfs"]
+        finding = "; ".join(row["risk_reasons"])
+        lines.append("| {table} | {strategy} | {risk_band} ({risk_score}) | {size} | {files} | {avg} | {zone} | {finding} |".format(
+            table=markdown_cell(row["table"]), strategy=markdown_cell(row["strategy"]),
+            risk_band=markdown_cell(row["risk_band"]), risk_score=row["risk_score"],
+            size=markdown_cell(row.get("size_gb", "n/a") or "n/a"), files=markdown_cell(row.get("files", "n/a") or "n/a"),
+            avg=markdown_cell(row.get("avg_file_mb", "n/a") or "n/a"),
+            zone=markdown_cell(hdfs.get("encryption_zone", "unavailable")), finding=markdown_cell(finding)))
+    parent = os.path.dirname(os.path.abspath(args.report_out))
+    os.makedirs(parent, exist_ok=True)
+    with open(args.report_out, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+    LOG.info("Assessment complete: %d objects; report=%s json=%s plan=%s", len(assessed), args.report_out, args.json_out, args.plan_out)
+    return 0 if preflight["ok"] else 2
 
 
 def parse_casts(value: str) -> Dict[str, str]:
@@ -990,6 +1150,16 @@ def build_parser() -> argparse.ArgumentParser:
     inventory.add_argument("--with-size", action="store_true")
     inventory.add_argument("--allow-avro-migrate", action="store_true")
 
+    assess = sub.add_parser("assess", help="read-only HDFS/Hive Iceberg migration assessment")
+    assess.add_argument("--databases", required=True, help="comma-separated Hive databases")
+    assess.add_argument("--report-out", default="iceberg_migration_assessment.md")
+    assess.add_argument("--json-out", default="iceberg_migration_assessment.json")
+    assess.add_argument("--plan-out", default="plan.csv")
+    assess.add_argument("--rewrite-throughput-gb-per-hour", type=float, default=250.0,
+                       help="planning assumption; calibrate from a representative pilot")
+    assess.add_argument("--allow-avro-migrate", action="store_true")
+    assess.add_argument("--allow-non-ha", action="store_true", help="pilot exception only")
+
     run = sub.add_parser("run", help="sandbox dry-run or approved execute")
     run.add_argument("--plan", default="plan.csv")
     run.add_argument("--only", default="")
@@ -1040,6 +1210,7 @@ def main() -> int:
         commands = {
             "preflight": cmd_preflight,
             "inventory": cmd_inventory,
+            "assess": cmd_assess,
             "run": cmd_run,
             "validate": cmd_validate,
             "rollback": cmd_rollback,
